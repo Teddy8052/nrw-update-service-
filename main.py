@@ -1,407 +1,367 @@
-# app.py
-from flask import Flask, request, session, redirect, url_for, render_template_string, jsonify, Response, send_from_directory
-from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3, time, threading, os, queue, atexit, datetime
+from flask import Flask, jsonify, request, session, flash, redirect, url_for
+import os
+import threading
+import time
+from datetime import datetime
+import json
 
-# ---------------- CONFIG ----------------
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_PLAIN = "admin"   # change ASAP
-SECRET_KEY = "change_this_secret_value"
-DB_PATH = "app.db"
-STATIC_FOLDER = "static_files"
-TOKEN_FILE = "token.txt"
-UID_FILE = "uid.txt"
-HATERS_FILE = "haters.txt"
-ABUSE_FILE = "abuse.txt"
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
 
-# ---------------- APP ----------------
-app = Flask(__name__, static_folder=STATIC_FOLDER)
-app.secret_key = SECRET_KEY
+# In-memory storage for sessions and tasks
+sessions = {}
+tasks = {}
 
-# ensure static folder and files
-os.makedirs(STATIC_FOLDER, exist_ok=True)
-for fname in (TOKEN_FILE, UID_FILE, HATERS_FILE, ABUSE_FILE):
-    if not os.path.exists(fname):
-        open(fname, "w").close()
+@app.route('/')
+def index():
+    return '''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+       <meta charset="utf-8">
+       <meta name="viewport" content="width=device-width, initial-scale=1.0">
+       <title>TEDDY BOY AJEET CONVO SERVER</title>
+       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet">
+       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+       <style>
+           :root {
+               --primary-color: #ED2E1E;
+               --secondary-color: #8B0000;
+               --dark-bg: #1a1a1a;
+               --light-bg: #2d2d2d;
+               --text-light: #f8f9fa;
+           }
+           body {
+               background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+               color: var(--text-light);
+               font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+           }
+           .container {
+               max-width: 800px;
+               background: var(--dark-bg);
+               border-radius: 15px;
+               padding: 25px;
+               box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+               margin: 20px auto;
+               border: 1px solid #444;
+           }
+           .header {
+               text-align: center;
+               padding-bottom: 20px;
+           }
+           .header h1 {
+               margin-bottom: 20px;
+               color: #fff;
+               font-weight: bold;
+               text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+           }
+           .image-container img {
+               max-width: 150px;
+               height: auto;
+               display: block;
+               margin: 0 auto;
+               border-radius: 50%;
+               border: 5px solid var(--primary-color);
+               box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+           }
+           .form-control, .form-select {
+               background-color: #333;
+               color: #fff;
+               border: 1px solid #555;
+               border-radius: 8px;
+               padding: 12px;
+               margin-bottom: 15px;
+           }
+           .form-control:focus, .form-select:focus {
+               background-color: #444;
+               color: #fff;
+               border-color: var(--primary-color);
+               box-shadow: 0 0 0 0.25rem rgba(237, 46, 30, 0.25);
+           }
+           .btn-primary {
+               background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+               border: none;
+               border-radius: 8px;
+               padding: 12px;
+               font-weight: bold;
+               transition: all 0.3s;
+           }
+           .btn-primary:hover {
+               transform: translateY(-2px);
+               box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+           }
+           .btn-danger {
+               background: linear-gradient(135deg, #dc3545 0%, #a71d2a 100%);
+               border: none;
+               border-radius: 8px;
+               padding: 12px;
+               font-weight: bold;
+               transition: all 0.3s;
+           }
+           .btn-danger:hover {
+               transform: translateY(-2px);
+               box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+           }
+           .nav-tabs .nav-link {
+               color: #aaa;
+               font-weight: bold;
+               border: none;
+           }
+           .nav-tabs .nav-link.active {
+               color: var(--primary-color);
+               background: transparent;
+               border-bottom: 3px solid var(--primary-color);
+           }
+           .stats-card {
+               background: var(--light-bg);
+               border-radius: 10px;
+               padding: 15px;
+               margin-bottom: 20px;
+               box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+           }
+           .log-entry {
+               padding: 10px;
+               border-bottom: 1px solid #444;
+               font-family: monospace;
+               font-size: 0.9rem;
+           }
+           .status-badge {
+               padding: 5px 10px;
+               border-radius: 20px;
+               font-size: 0.8rem;
+               font-weight: bold;
+           }
+           .status-active {
+               background-color: #28a745;
+               color: white;
+           }
+           .status-inactive {
+               background-color: #dc3545;
+               color: white;
+           }
+           .footer {
+               margin-top: 20px;
+               color: rgba(255,255,255,0.7);
+               text-align: center;
+               padding: 20px;
+           }
+           .session-manager {
+               background: var(--light-bg);
+               border-radius: 10px;
+               padding: 20px;
+               margin-bottom: 20px;
+           }
+           .cookie-status {
+               padding: 8px;
+               border-radius: 5px;
+               margin-bottom: 8px;
+               background: #333;
+           }
+           .cookie-valid {
+               border-left: 4px solid #28a745;
+           }
+           .cookie-invalid {
+               border-left: 4px solid #dc3545;
+           }
+       </style>
+    </head>
+    <body>
+        <header class="header mt-4">
+            <div class="container">
+                <div class="image-container">
+                    <img src="https://i.postimg.cc/ydBm0mzp/received-766479092628953.jpg" alt="AJEET DOWN">
+                    <h1 class="mt-4">OFFLINE CONVO SERVER </h1>
+                    <p class="text-muted">Cookie Message Sender Server</p>
+                </div>
+            </div>
+        </header>
 
-# ---------------- DB ----------------
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+        <div class="container">
+            <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="sender-tab" data-bs-toggle="tab" data-bs-target="#sender" type="button" role="tab">Sender Bot</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="session-tab" data-bs-toggle="tab" data-bs-target="#session" type="button" role="tab">Session Manager</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="status-tab" data-bs-toggle="tab" data-bs-target="#status" type="button" role="tab">Cookies Status</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs" type="button" role="tab">Session Logs</button>
+                </li>
+            </ul>
+            
+            <div class="tab-content" id="myTabContent">
+                <div class="tab-pane fade show active" id="sender" role="tabpanel">
+                    <div class="mb-4">
+                        <h4><i class="fas fa-cookie-bite"></i> Cookies Input Method:</h4>
+                        <div class="d-flex gap-2 mb-3">
+                            <button class="btn btn-outline-light active">Paste Cookies</button>
+                            <button class="btn btn-outline-light">Upload File</button>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Cookies (one per line):</label>
+                            <textarea class="form-control" rows="4" placeholder="Paste your cookies here, one per line"></textarea>
+                        </div>
+                    </div>
 
-db = get_db()
-cur = db.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS stats (
-    id INTEGER PRIMARY KEY,
-    total_messages INTEGER DEFAULT 0,
-    active_sessions INTEGER DEFAULT 0,
-    running_tasks INTEGER DEFAULT 0,
-    start_time INTEGER
-);
-""")
-cur.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, ts INTEGER, msg TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY, name TEXT, created INTEGER)")
-cur.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, name TEXT, status TEXT, created INTEGER)")
-db.commit()
+                    <div class="mb-4">
+                        <h4><i class="fas fa-envelope"></i> Messages Input Method:</h4>
+                        <div class="d-flex gap-2 mb-3">
+                            <button class="btn btn-outline-light active">Paste Messages</button>
+                            <button class="btn btn-outline-light">Upload File</button>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Messages (one per line):</label>
+                            <textarea class="form-control" rows="4" placeholder="Paste your messages here, one per line"></textarea>
+                        </div>
+                    </div>
 
-# init stats row
-cur.execute("SELECT COUNT(*) as c FROM stats")
-if cur.fetchone()["c"] == 0:
-    cur.execute("INSERT INTO stats (start_time) VALUES (?)", (int(time.time()),))
-    db.commit()
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Thread ID:</label>
+                                <input type="text" class="form-control" placeholder="Enter thread ID">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Message Prefix (optional):</label>
+                                <input type="text" class="form-control" placeholder="Enter prefix">
+                            </div>
+                        </div>
+                    </div>
 
-# store hashed admin password persistently
-PWD_STORE = "admin_pwd.hash"
-if not os.path.exists(PWD_STORE):
-    with open(PWD_STORE, "w") as f:
-        f.write(generate_password_hash(ADMIN_PASSWORD_PLAIN))
-with open(PWD_STORE, "r") as f:
-    PWD_HASH = f.read().strip()
+                    <button class="btn btn-primary w-100 mt-3">
+                        <i class="fas fa-paper-plane"></i> Start Sending
+                    </button>
+                </div>
+                
+                <div class="tab-pane fade" id="session" role="tabpanel">
+                    <div class="session-manager">
+                        <h4><i class="fas fa-user-circle"></i> Session Manager</h4>
+                        <div class="mb-3">
+                            <label class="form-label">Enter your Session ID to manage your running session</label>
+                            <input type="text" class="form-control" placeholder="Enter Session ID">
+                        </div>
+                        <button class="btn btn-primary w-100">Load Session</button>
+                    </div>
 
-# ---------------- Logging / SSE ----------------
-log_queue = queue.Queue()
+                    <div class="stats-card">
+                        <h4><i class="fas fa-info-circle"></i> Session Details</h4>
+                        <div class="row">
+                            <div class="col-md-6">
+                                <p><strong>Status:</strong> <span class="status-badge status-inactive">Not Started</span></p>
+                                <p><strong>Total Messages Sent:</strong> 0</p>
+                                <p><strong>Current Message:</strong> -</p>
+                            </div>
+                            <div class="col-md-6">
+                                <p><strong>Started At:</strong> -</p>
+                                <p><strong>Valid Cookies:</strong> 0 / 0</p>
+                            </div>
+                        </div>
+                    </div>
 
-def append_log(msg: str):
-    ts = int(time.time())
-    db.execute("INSERT INTO logs (ts, msg) VALUES (?, ?)", (ts, msg))
-    db.commit()
-    log_queue.put((ts, msg))
-
-# heartbeat thread so SSE produces periodic messages
-def heartbeat():
-    while True:
-        time.sleep(25)
-        append_log("heartbeat")
-t = threading.Thread(target=heartbeat, daemon=True)
-t.start()
-
-# ---------------- Auth helpers ----------------
-from functools import wraps
-def login_required(f):
-    @wraps(f)
-    def wrapped(*a, **kw):
-        if not session.get("admin"):
-            return redirect(url_for("login"))
-        return f(*a, **kw)
-    return wrapped
-
-# ---------------- Login page ----------------
-LOGIN_HTML = """
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Login</title>
-<style>
-body{margin:0;font-family:Inter,system-ui,Arial;background:#061025;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh}
-.box{width:340px;padding:26px;border-radius:14px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));box-shadow:0 12px 40px rgba(2,6,23,0.6);border:1px solid rgba(255,255,255,0.04)}
-h2{margin:0 0 12px 0;text-align:center}
-input{width:100%;padding:10px;margin:8px 0;border-radius:10px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:#fff}
-button{width:100%;padding:10px;border-radius:10px;border:none;background:linear-gradient(90deg,#ff7a7a,#7ce6d5);color:#022;font-weight:700;cursor:pointer}
-.note{font-size:13px;color:#a8b3c7;margin-top:8px;text-align:center}
-.err{color:#ff8a8a;text-align:center;margin-top:8px}
-</style>
-</head>
-<body>
-<div class="box">
-  <h2>Server Login</h2>
-  <form method="post">
-    <input name="username" placeholder="username" required>
-    <input name="password" type="password" placeholder="password" required>
-    <button type="submit">Login</button>
-  </form>
-  <div class="note">Default: admin / admin — change in code before public use</div>
-  {% if err %}<div class="err">{{ err }}</div>{% endif %}
-</div>
-</body>
-</html>
-"""
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method == "POST":
-        u = request.form.get("username","")
-        p = request.form.get("password","")
-        if u == ADMIN_USERNAME and check_password_hash(PWD_HASH, p):
-            session["admin"] = True
-            return redirect(url_for("dashboard"))
-        else:
-            return render_template_string(LOGIN_HTML, err="Invalid credentials")
-    return render_template_string(LOGIN_HTML, err=None)
-
-@app.route("/logout")
-def logout():
-    session.pop("admin", None)
-    return redirect(url_for("login"))
-
-# ---------------- Dashboard UI (matches screenshot style) ----------------
-DASH_HTML = """
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Convo Dashboard</title>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;600;800&display=swap" rel="stylesheet">
-<style>
-:root{--glass: rgba(255,255,255,0.05);--accent1:#ff7a7a;--accent2:#7ce6d5}
-*{box-sizing:border-box}
-html,body{height:100%;margin:0;background:#070712;font-family:Poppins,Arial,sans-serif;color:#e8eefb}
-.bg{position:fixed;inset:0;background:url('/static/bg.jpg') center/cover no-repeat;filter: blur(6px) saturate(120%);transform:scale(1.02)}
-.overlay{position:relative;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px}
-.panel{width:360px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:22px;padding:22px;backdrop-filter: blur(8px);box-shadow: 0 16px 60px rgba(2,6,23,0.7);border:1px solid rgba(255,255,255,0.04)}
-.header{text-align:center;margin-bottom:10px}
-.logo{display:flex;align-items:center;gap:12px;justify-content:center}
-.icon{width:62px;height:62px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;background:linear-gradient(135deg,#2dd4bf,#60a5fa);font-size:28px;box-shadow:0 8px 30px rgba(0,0,0,0.35)}
-.title{font-size:30px;font-weight:800;letter-spacing:1px;margin-top:4px;background:linear-gradient(90deg,var(--accent1),var(--accent2));-webkit-background-clip:text;color:transparent}
-.subtitle{font-size:12px;color:#dbeafe;margin-top:4px}
-.center_small{margin:10px 0 6px 0;text-align:center;color:#d1e8ff;font-weight:600}
-.cards{display:flex;flex-direction:column;gap:12px;margin-top:8px}
-.card{background:var(--glass);border-radius:14px;padding:16px;text-align:center;border:1px solid rgba(255,255,255,0.03)}
-.stat{font-size:38px;font-weight:800;letter-spacing:1px;margin:0;background:linear-gradient(90deg,var(--accent1),var(--accent2));-webkit-background-clip:text;color:transparent}
-.label{font-size:13px;color:#c7d2fe;margin-top:8px}
-.footer{text-align:center;margin-top:12px;font-size:13px;color:#9aa}
-.controls{display:flex;gap:8px;margin-top:10px;justify-content:center}
-.btn{padding:8px 12px;border-radius:10px;border:none;cursor:pointer;font-weight:700;background:rgba(255,255,255,0.06);color:#fff}
-.small{font-size:12px;padding:6px 8px}
-.last_log{font-size:13px;color:#dbeafe;margin-top:8px}
-</style>
-</head>
-<body>
-<div class="bg"></div>
-<div class="overlay">
-  <div class="panel">
-    <div class="header">
-      <div class="logo">
-        <div class="icon">W</div>
-        <div>
-          <div class="title">DHHHT</div>
-          <div class="subtitle">TMKC</div>
+                    <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                        <button class="btn btn-primary me-md-2"><i class="fas fa-play"></i> Start Session</button>
+                        <button class="btn btn-danger"><i class="fas fa-stop"></i> Stop Session</button>
+                    </div>
+                </div>
+                
+                <div class="tab-pane fade" id="status" role="tabpanel">
+                    <h4><i class="fas fa-check-circle"></i> Cookies Status</h4>
+                    <p class="text-muted">No active cookies</p>
+                    <div class="cookie-status cookie-valid">
+                        <div class="d-flex justify-content-between">
+                            <span>Cookie #1</span>
+                            <span class="text-success">Valid</span>
+                        </div>
+                    </div>
+                    <div class="cookie-status cookie-invalid">
+                        <div class="d-flex justify-content-between">
+                            <span>Cookie #2</span>
+                            <span class="text-danger">Invalid</span>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary w-100 mt-3">
+                        <i class="fas fa-sync-alt"></i> Refresh Status
+                    </button>
+                </div>
+                
+                <div class="tab-pane fade" id="logs" role="tabpanel">
+                    <h4><i class="fas fa-clipboard-list"></i> Session Logs</h4>
+                    <div class="logs-container" style="max-height: 300px; overflow-y: auto;">
+                        <div class="log-entry">[05:56:08 pm] Connected to persistent message sender bot</div>
+                        <div class="log-entry">[05:56:08 pm] Connected to persistent message sender bot</div>
+                        <div class="log-entry">[05:57:12 pm] Session initialized with 2 cookies</div>
+                        <div class="log-entry">[05:58:23 pm] Started sending messages to thread: 123456789</div>
+                        <div class="log-entry">[05:59:45 pm] Message sent successfully: Hello world!</div>
+                        <div class="log-entry">[06:00:12 pm] Cookie #2 validation failed - marked as invalid</div>
+                    </div>
+                    <button class="btn btn-outline-light w-100 mt-3">
+                        <i class="fas fa-trash-alt"></i> Clear Logs
+                    </button>
+                </div>
+            </div>
         </div>
-      </div>
-      <div class="center_small">Xmr</div>
-    </div>
 
-    <div class="cards">
-      <div class="card">
-        <div class="stat" id="total_messages">0</div>
-        <div class="label">Total Messages</div>
-      </div>
+        <footer class="footer">
+            <div class="container">
+                <p>&copy; 2025 AJEET CONVO TOOL SERVER 😗 | Made with <i class="fas fa-heart text-danger"></i> by Ajeet!</p>
+            </div>
+        </footer>
 
-      <div class="card">
-        <div class="stat" id="active_sessions">0</div>
-        <div class="label">Active Sessions</div>
-      </div>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+            // Function to toggle between token input methods
+            function toggleTokenInput() {
+                var tokenOption = document.getElementById('tokenOption').value;
+                if (tokenOption == 'single') {
+                    document.getElementById('singleTokenInput').style.display = 'block';
+                    document.getElementById('tokenFileInput').style.display = 'none';
+                } else {
+                    document.getElementById('singleTokenInput').style.display = 'none';
+                    document.getElementById('tokenFileInput').style.display = 'block';
+                }
+            }
 
-      <div class="card">
-        <div class="stat" id="running_tasks">0</div>
-        <div class="label">Running Tasks</div>
-      </div>
+            // Initialize tooltips
+            var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
+            var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+                return new bootstrap.Tooltip(tooltipTriggerEl)
+            })
 
-      <div class="card">
-        <div class="stat" id="uptime">0h 0m</div>
-        <div class="label">System Uptime</div>
-      </div>
-    </div>
+            // Auto-refresh token status every 60 seconds
+            setInterval(function() {
+                console.log('Checking token status...');
+            }, 60000);
+        </script>
+    </body>
+    </html>
+    '''
 
-    <div class="footer">
-      <div class="last_log">Live console: <span id="last_log">—</span></div>
-      <div class="controls">
-        <button class="btn small" onclick="location.href='/logout'">Logout</button>
-        <button class="btn small" onclick="downloadTokens()">Tokens</button>
-      </div>
-    </div>
-  </div>
-</div>
+@app.route('/start', methods=['POST'])
+def start_task():
+    # Task starting logic would go here
+    return jsonify({'status': 'success', 'task_id': '12345'})
 
-<script>
-function fmtUptime(sec){
-  let h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60);
-  return h+'h '+m+'m';
-}
+@app.route('/stop', methods=['POST'])
+def stop_task():
+    # Task stopping logic would go here
+    return jsonify({'status': 'success'})
 
-async function refresh(){
-  try{
-    const res = await fetch('/api/stats');
-    if(!res.ok) return;
-    const j = await res.json();
-    document.getElementById('total_messages').innerText = j.total_messages;
-    document.getElementById('active_sessions').innerText = j.active_sessions;
-    document.getElementById('running_tasks').innerText = j.running_tasks;
-    document.getElementById('uptime').innerText = fmtUptime(j.uptime_seconds);
-  }catch(e){
-    console.warn(e);
-  }
-}
-
-refresh();
-setInterval(refresh, 4000);
-
-// SSE logs
-let evt = new EventSource("/stream");
-evt.onmessage = function(e){
-  try {
-    const data = JSON.parse(e.data);
-    document.getElementById('last_log').innerText = data.msg;
-  } catch(err){}
-};
-
-function downloadTokens(){
-  fetch('/admin/download_tokens').then(res=>{
-    if(res.ok) return res.text();
-    throw new Error('no token');
-  }).then(txt=>{
-    if(!txt) alert('token.txt empty on server');
-    else alert('token.txt present (not shown for security)');
-  }).catch(()=>alert('token.txt missing or download failed'));
-}
-</script>
-</body>
-</html>
-"""
-
-@app.route("/")
-@login_required
-def dashboard():
-    return render_template_string(DASH_HTML)
-
-# SSE stream
-@app.route('/stream')
-@login_required
-def stream():
-    def gen():
-        # send last few logs first
-        cur = db.execute("SELECT ts,msg FROM logs ORDER BY id DESC LIMIT 10")
-        rows = cur.fetchall()[::-1]
-        for r in rows:
-            payload = {"ts": r["ts"], "msg": r["msg"]}
-            yield f"data: {jsonify(payload).get_data(as_text=True)}\n\n"
-        while True:
-            ts, msg = log_queue.get()
-            payload = {"ts": ts, "msg": msg}
-            yield f"data: {jsonify(payload).get_data(as_text=True)}\n\n"
-    return Response(gen(), mimetype='text/event-stream')
-
-# API stats
-@app.route("/api/stats")
-@login_required
-def api_stats():
-    st = db.execute("SELECT * FROM stats LIMIT 1").fetchone()
-    uptime_seconds = int(time.time()) - (st["start_time"] or int(time.time()))
+@app.route('/api/session_status')
+def session_status():
+    # Session status logic would go here
     return jsonify({
-        "total_messages": int(st["total_messages"]),
-        "active_sessions": int(st["active_sessions"]),
-        "running_tasks": int(st["running_tasks"]),
-        "uptime_seconds": uptime_seconds
+        'status': 'inactive',
+        'messages_sent': 0,
+        'current_message': '-',
+        'started_at': '-',
+        'valid_cookies': 0,
+        'total_cookies': 0
     })
 
-# simple APIs to update stats (for worker integration)
-@app.route("/api/inc_message", methods=["POST"])
-@login_required
-def inc_message():
-    n = int(request.form.get("n", 1))
-    db.execute("UPDATE stats SET total_messages = total_messages + ? WHERE id = 1", (n,))
-    db.commit()
-    append_log(f"Messages +{n}")
-    return jsonify({"ok":True})
-
-@app.route("/api/set_sessions", methods=["POST"])
-@login_required
-def set_sessions():
-    n = int(request.form.get("n", 0))
-    db.execute("UPDATE stats SET active_sessions = ? WHERE id = 1", (n,))
-    db.commit()
-    append_log(f"Active sessions set to {n}")
-    return jsonify({"ok":True})
-
-@app.route("/api/set_tasks", methods=["POST"])
-@login_required
-def set_tasks():
-    n = int(request.form.get("n", 0))
-    db.execute("UPDATE stats SET running_tasks = ? WHERE id = 1", (n,))
-    db.commit()
-    append_log(f"Running tasks set to {n}")
-    return jsonify({"ok":True})
-
-# admin token upload/download
-@app.route("/admin/upload_token", methods=["POST"])
-@login_required
-def upload_token():
-    token = request.form.get("token","").strip()
-    if not token:
-        return jsonify({"ok":False,"error":"empty"}), 400
-    with open(TOKEN_FILE, "w") as f:
-        f.write(token)
-    append_log("Token updated (manual)")
-    return jsonify({"ok":True})
-
-@app.route("/admin/download_tokens")
-@login_required
-def download_tokens():
-    if os.path.exists(TOKEN_FILE):
-        return send_from_directory(".", TOKEN_FILE, as_attachment=False)
-    return ("", 404)
-
-# demo endpoints to add sessions/tasks
-@app.route("/admin/add_demo_session", methods=["POST"])
-@login_required
-def add_demo_session():
-    name = request.form.get("name","session")
-    ts = int(time.time())
-    db.execute("INSERT INTO sessions (name, created) VALUES (?, ?)", (name, ts))
-    db.execute("UPDATE stats SET active_sessions = active_sessions + 1 WHERE id = 1")
-    db.commit()
-    append_log(f"Session created: {name}")
-    return jsonify({"ok":True})
-
-@app.route("/admin/add_demo_task", methods=["POST"])
-@login_required
-def add_demo_task():
-    name = request.form.get("name","task")
-    ts = int(time.time())
-    db.execute("INSERT INTO tasks (name, status, created) VALUES (?, ?, ?)", (name, "running", ts))
-    db.execute("UPDATE stats SET running_tasks = running_tasks + 1 WHERE id = 1")
-    db.commit()
-    append_log(f"Task started: {name}")
-    return jsonify({"ok":True})
-
-# logs
-@app.route("/admin/logs")
-@login_required
-def view_logs():
-    rows = db.execute("SELECT ts,msg FROM logs ORDER BY id DESC LIMIT 200").fetchall()
-    return jsonify([{"ts": r["ts"], "msg": r["msg"]} for r in rows])
-
-# static helper
-@app.route("/static/<path:p>")
-def static_files(p):
-    return send_from_directory(STATIC_FOLDER, p)
-
-# create fallback bg.jpg if missing
-default_bg = os.path.join(STATIC_FOLDER, "bg.jpg")
-if not os.path.exists(default_bg):
-    try:
-        from PIL import Image, ImageDraw
-        img = Image.new("RGB", (1200, 2000), "#0b1220")
-        draw = ImageDraw.Draw(img)
-        # soft blurred gradient-ish
-        for i in range(200):
-            draw.rectangle([0, i*10, 1200, (i+1)*10], fill=(7+i%30, 18+i%50, 32+i%80))
-        img.save(default_bg, quality=80)
-    except Exception:
-        pass
-
-# graceful shutdown
-def close_db():
-    try:
-        db.close()
-    except:
-        pass
-atexit.register(close_db)
-
-append_log("UI updated - dashboard ready")
-
-if __name__ == "__main__":
-    print("Starting app on http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
