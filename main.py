@@ -1,686 +1,811 @@
-from flask import Flask, jsonify, request, session, flash, redirect, url_for, send_from_directory
-import os
-import threading
-import time
-import json
-from datetime import datetime
-from werkzeug.utils import secure_filename
+const express = require('express');
+const multer = require('multer');
+const pino = require('pino');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { default: makeWASocket, Browsers, delay, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason } = require("@whiskeysockets/baileys");
+const NodeCache = require('node-cache');
+const bodyParser = require('body-parser');
+const moment = require('moment-timezone');
 
-# ------------- Config -------------
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+const app = express();
+const upload = multer({
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB max file size
+  }
+});
 
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+// Improved session management with cleanup
+const activeSessions = new Map();
+const sessionLogs = new Map();
 
-# ------------- In-memory stores -------------
-SESSIONS = {}    # session_id -> session data
-LOGS = {}        # session_id -> [log lines]
-THREADS = {}     # session_id -> Thread object
+// Memory management
+const MAX_MESSAGES_PER_SESSION = 1000;
+const SESSION_CLEANUP_INTERVAL = 5 * 60 * 1000; // Cleanup every 5 minutes
 
-# ---------- Utilities ----------
-def timestamp():
-    return datetime.now().strftime("%I:%M:%S %p")
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json({ limit: '10mb' }));
 
-def add_log(session_id, message):
-    line = f"[{timestamp()}] {message}"
-    if session_id not in LOGS:
-        LOGS[session_id] = []
-    LOGS[session_id].append(line)
-    # keep logs bounded (optional)
-    if len(LOGS[session_id]) > 1000:
-        LOGS[session_id] = LOGS[session_id][-1000:]
+// Session cleanup interval
+setInterval(() => {
+  cleanupInactiveSessions();
+}, SESSION_CLEANUP_INTERVAL);
 
-# ---------- Background "sender" (simulation) ----------
-def message_sender(session_id):
-    """
-    Simulates sending messages. DOES NOT perform any real interaction with
-    Facebook or other platforms. This only updates session counters and logs.
-    """
-    s = SESSIONS.get(session_id)
-    if not s:
-        return
-
-    add_log(session_id, f"Simulation: Session started (cookies: {len(s['cookies'])}, messages: {len(s['messages'])})")
-    s['status'] = 'active'
-    s['start_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    try:
-        # Round-robin through cookies (simulation)
-        cookies = s['cookies'] if s['cookies'] else []
-        messages = s['messages'] if s['messages'] else []
-        prefix = s.get('prefix', '').strip()
-        thread_id = s.get('thread_id', '').strip()
-
-        if not messages:
-            add_log(session_id, "No messages provided — nothing to send.")
-            s['status'] = 'finished'
-            return
-
-        cookie_index = 0
-        for i, msg in enumerate(messages):
-            # check stop flag
-            if s.get('stop', False):
-                add_log(session_id, "Session stopped by user.")
-                s['status'] = 'stopped'
-                return
-
-            # simulate work / delay
-            time.sleep(s.get('delay_seconds', 1))
-
-            # simulate selecting a cookie
-            cookie_used = cookies[cookie_index] if cookies else "NO_COOKIE"
-            cookie_index = (cookie_index + 1) % max(1, len(cookies))
-
-            full_msg = (prefix + " " + msg).strip() if prefix else msg
-            s['sent'] += 1
-            s['current_msg'] = full_msg
-
-            # log the simulated send
-            add_log(session_id, f"Simulated send to thread '{thread_id}' using cookie '{cookie_used[:30]}...': {full_msg}")
-
-        s['status'] = 'finished'
-        add_log(session_id, "Simulation: Session completed successfully.")
-    except Exception as e:
-        add_log(session_id, f"Error in sender thread: {str(e)}")
-        s['status'] = 'error'
-
-# ---------- Routes ----------
-@app.route('/')
-def index():
-    # original UI HTML (kept as close to the user's provided HTML as possible)
-    # I added some small JS hooks at the bottom to call the backend (/start, /stop, /api/session_status, /api/logs)
-    # UI content retained; added client-side code to make it functional.
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-       <meta charset="utf-8">
-       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-       <title>TEDDY BOY AJEET CONVO SERVER</title>
-       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet">
-       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
-       <style>
-           :root {
-               --primary-color: #ED2E1E;
-               --secondary-color: #8B0000;
-               --dark-bg: #1a1a1a;
-               --light-bg: #2d2d2d;
-               --text-light: #f8f9fa;
-           }
-           body {
-               background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
-               color: var(--text-light);
-               font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-           }
-           .container {
-               max-width: 800px;
-               background: var(--dark-bg);
-               border-radius: 15px;
-               padding: 25px;
-               box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-               margin: 20px auto;
-               border: 1px solid #444;
-           }
-           .header {
-               text-align: center;
-               padding-bottom: 20px;
-           }
-           .header h1 {
-               margin-bottom: 20px;
-               color: #fff;
-               font-weight: bold;
-               text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
-           }
-           .image-container img {
-               max-width: 150px;
-               height: auto;
-               display: block;
-               margin: 0 auto;
-               border-radius: 50%;
-               border: 5px solid var(--primary-color);
-               box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-           }
-           .form-control, .form-select {
-               background-color: #333;
-               color: #fff;
-               border: 1px solid #555;
-               border-radius: 8px;
-               padding: 12px;
-               margin-bottom: 15px;
-           }
-           .form-control:focus, .form-select:focus {
-               background-color: #444;
-               color: #fff;
-               border-color: var(--primary-color);
-               box-shadow: 0 0 0 0.25rem rgba(237, 46, 30, 0.25);
-           }
-           .btn-primary {
-               background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
-               border: none;
-               border-radius: 8px;
-               padding: 12px;
-               font-weight: bold;
-               transition: all 0.3s;
-           }
-           .btn-primary:hover {
-               transform: translateY(-2px);
-               box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-           }
-           .btn-danger {
-               background: linear-gradient(135deg, #dc3545 0%, #a71d2a 100%);
-               border: none;
-               border-radius: 8px;
-               padding: 12px;
-               font-weight: bold;
-               transition: all 0.3s;
-           }
-           .btn-danger:hover {
-               transform: translateY(-2px);
-               box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-           }
-           .nav-tabs .nav-link {
-               color: #aaa;
-               font-weight: bold;
-               border: none;
-           }
-           .nav-tabs .nav-link.active {
-               color: var(--primary-color);
-               background: transparent;
-               border-bottom: 3px solid var(--primary-color);
-           }
-           .stats-card {
-               background: var(--light-bg);
-               border-radius: 10px;
-               padding: 15px;
-               margin-bottom: 20px;
-               box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-           }
-           .log-entry {
-               padding: 10px;
-               border-bottom: 1px solid #444;
-               font-family: monospace;
-               font-size: 0.9rem;
-           }
-           .status-badge {
-               padding: 5px 10px;
-               border-radius: 20px;
-               font-size: 0.8rem;
-               font-weight: bold;
-           }
-           .status-active {
-               background-color: #28a745;
-               color: white;
-           }
-           .status-inactive {
-               background-color: #dc3545;
-               color: white;
-           }
-           .footer {
-               margin-top: 20px;
-               color: rgba(255,255,255,0.7);
-               text-align: center;
-               padding: 20px;
-           }
-           .session-manager {
-               background: var(--light-bg);
-               border-radius: 10px;
-               padding: 20px;
-               margin-bottom: 20px;
-           }
-           .cookie-status {
-               padding: 8px;
-               border-radius: 5px;
-               margin-bottom: 8px;
-               background: #333;
-           }
-           .cookie-valid {
-               border-left: 4px solid #28a745;
-           }
-           .cookie-invalid {
-               border-left: 4px solid #dc3545;
-           }
-       </style>
-    </head>
-    <body>
-        <header class="header mt-4">
-            <div class="container">
-                <div class="image-container">
-                    <img src="https://i.postimg.cc/ydBm0mzp/received-766479092628953.jpg" alt="AJEET DOWN">
-                    <h1 class="mt-4">OFFLINE CONVO SERVER </h1>
-                    <p class="text-muted">Cookie Message Sender Server</p>
-                </div>
-            </div>
-        </header>
-
-        <div class="container">
-            <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link active" id="sender-tab" data-bs-toggle="tab" data-bs-target="#sender" type="button" role="tab">Sender Bot</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="session-tab" data-bs-toggle="tab" data-bs-target="#session" type="button" role="tab">Session Manager</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="status-tab" data-bs-toggle="tab" data-bs-target="#status" type="button" role="tab">Cookies Status</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs" type="button" role="tab">Session Logs</button>
-                </li>
-            </ul>
-            
-            <div class="tab-content" id="myTabContent">
-                <div class="tab-pane fade show active" id="sender" role="tabpanel">
-                    <div class="mb-4">
-                        <h4><i class="fas fa-cookie-bite"></i> Cookies Input Method:</h4>
-                        <div class="d-flex gap-2 mb-3">
-                            <button class="btn btn-outline-light active">Paste Cookies</button>
-                            <button class="btn btn-outline-light" id="uploadCookieBtn">Upload File</button>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label">Cookies (one per line):</label>
-                            <textarea id="cookiesText" class="form-control" rows="4" placeholder="Paste your cookies here, one per line"></textarea>
-                        </div>
-
-                        <!-- hidden file input -->
-                        <div class="mb-3" id="cookieFileWrap" style="display:none;">
-                            <label class="form-label">Upload cookies file (.txt):</label>
-                            <input type="file" id="cookieFile" class="form-control" accept=".txt">
-                        </div>
-                    </div>
-
-                    <div class="mb-4">
-                        <h4><i class="fas fa-envelope"></i> Messages Input Method:</h4>
-                        <div class="d-flex gap-2 mb-3">
-                            <button class="btn btn-outline-light active">Paste Messages</button>
-                            <button class="btn btn-outline-light" id="uploadMsgBtn">Upload File</button>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label">Messages (one per line):</label>
-                            <textarea id="messagesText" class="form-control" rows="4" placeholder="Paste your messages here, one per line"></textarea>
-                        </div>
-
-                        <div class="mb-3" id="msgFileWrap" style="display:none;">
-                            <label class="form-label">Upload messages file (.txt):</label>
-                            <input type="file" id="msgFile" class="form-control" accept=".txt">
-                        </div>
-                    </div>
-
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label class="form-label">Thread ID:</label>
-                                <input id="threadId" type="text" class="form-control" placeholder="Enter thread ID">
-                            </div>
-                        </div>
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label class="form-label">Message Prefix (optional):</label>
-                                <input id="prefix" type="text" class="form-control" placeholder="Enter prefix">
-                            </div>
-                        </div>
-                    </div>
-
-                    <button id="startBtn" class="btn btn-primary w-100 mt-3">
-                        <i class="fas fa-paper-plane"></i> Start Sending
-                    </button>
-                </div>
-                
-                <div class="tab-pane fade" id="session" role="tabpanel">
-                    <div class="session-manager">
-                        <h4><i class="fas fa-user-circle"></i> Session Manager</h4>
-                        <div class="mb-3">
-                            <label class="form-label">Enter your Session ID to manage your running session</label>
-                            <input id="manageSessionId" type="text" class="form-control" placeholder="Enter Session ID">
-                        </div>
-                        <button id="loadSessionBtn" class="btn btn-primary w-100">Load Session</button>
-                    </div>
-
-                    <div class="stats-card">
-                        <h4><i class="fas fa-info-circle"></i> Session Details</h4>
-                        <div class="row">
-                            <div class="col-md-6">
-                                <p><strong>Status:</strong> <span id="statusBadge" class="status-badge status-inactive">Not Started</span></p>
-                                <p><strong>Total Messages Sent:</strong> <span id="totalSent">0</span></p>
-                                <p><strong>Current Message:</strong> <span id="currentMsg">-</span></p>
-                            </div>
-                            <div class="col-md-6">
-                                <p><strong>Started At:</strong> <span id="startedAt">-</span></p>
-                                <p><strong>Valid Cookies:</strong> <span id="validCookies">0 / 0</span></p>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="d-grid gap-2 d-md-flex justify-content-md-end">
-                        <button id="startSessionBtn" class="btn btn-primary me-md-2"><i class="fas fa-play"></i> Start Session</button>
-                        <button id="stopSessionBtn" class="btn btn-danger"><i class="fas fa-stop"></i> Stop Session</button>
-                    </div>
-                </div>
-                
-                <div class="tab-pane fade" id="status" role="tabpanel">
-                    <h4><i class="fas fa-check-circle"></i> Cookies Status</h4>
-                    <p class="text-muted" id="cookiesStatusText">No active cookies</p>
-                    <div id="cookieStatusContainer">
-                        <div class="cookie-status cookie-valid">
-                            <div class="d-flex justify-content-between">
-                                <span>Cookie #1</span>
-                                <span class="text-success">Valid</span>
-                            </div>
-                        </div>
-                        <div class="cookie-status cookie-invalid">
-                            <div class="d-flex justify-content-between">
-                                <span>Cookie #2</span>
-                                <span class="text-danger">Invalid</span>
-                            </div>
-                        </div>
-                    </div>
-                    <button id="refreshStatusBtn" class="btn btn-primary w-100 mt-3">
-                        <i class="fas fa-sync-alt"></i> Refresh Status
-                    </button>
-                </div>
-                
-                <div class="tab-pane fade" id="logs" role="tabpanel">
-                    <h4><i class="fas fa-clipboard-list"></i> Session Logs</h4>
-                    <div class="logs-container" id="logsContainer" style="max-height: 300px; overflow-y: auto;">
-                        <div class="log-entry">[05:56:08 pm] Connected to persistent message sender bot</div>
-                        <div class="log-entry">[05:56:08 pm] Connected to persistent message sender bot</div>
-                        <div class="log-entry">[05:57:12 pm] Session initialized with 2 cookies</div>
-                        <div class="log-entry">[05:58:23 pm] Started sending messages to thread: 123456789</div>
-                        <div class="log-entry">[05:59:45 pm] Message sent successfully: Hello world!</div>
-                        <div class="log-entry">[06:00:12 pm] Cookie #2 validation failed - marked as invalid</div>
-                    </div>
-                    <button id="clearLogsBtn" class="btn btn-outline-light w-100 mt-3">
-                        <i class="fas fa-trash-alt"></i> Clear Logs
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <footer class="footer">
-            <div class="container">
-                <p>&copy; 2025 AJEET CONVO TOOL SERVER 😗 | Made with <i class="fas fa-heart text-danger"></i> by Ajeet!</p>
-            </div>
-        </footer>
-
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"></script>
-        <script>
-            // small UI helpers for file upload toggles
-            document.getElementById('uploadCookieBtn').addEventListener('click', function(){
-                var w = document.getElementById('cookieFileWrap');
-                w.style.display = (w.style.display === 'none' ? 'block' : 'none');
-            });
-            document.getElementById('uploadMsgBtn').addEventListener('click', function(){
-                var w = document.getElementById('msgFileWrap');
-                w.style.display = (w.style.display === 'none' ? 'block' : 'none');
-            });
-
-            // Read uploaded text files into textareas
-            function readFileToTextarea(inputEl, textareaEl) {
-                var f = inputEl.files[0];
-                if (!f) return;
-                var r = new FileReader();
-                r.onload = function(e){ textareaEl.value = e.target.result; };
-                r.readAsText(f);
-            }
-            document.getElementById('cookieFile').addEventListener('change', function(){ readFileToTextarea(this, document.getElementById('cookiesText')); });
-            document.getElementById('msgFile').addEventListener('change', function(){ readFileToTextarea(this, document.getElementById('messagesText')); });
-
-            // Start button -> call /start
-            document.getElementById('startBtn').addEventListener('click', async function(){
-                const cookiesRaw = document.getElementById('cookiesText').value.trim();
-                const messagesRaw = document.getElementById('messagesText').value.trim();
-                const threadId = document.getElementById('threadId').value.trim();
-                const prefix = document.getElementById('prefix').value.trim();
-
-                const cookies = cookiesRaw ? cookiesRaw.split('\\n').map(s=>s.trim()).filter(Boolean) : [];
-                const messages = messagesRaw ? messagesRaw.split('\\n').map(s=>s.trim()).filter(Boolean) : [];
-
-                if (messages.length === 0) {
-                    alert('Please add at least one message.');
-                    return;
-                }
-
-                const payload = {
-                    cookies: cookies,
-                    messages: messages,
-                    thread_id: threadId,
-                    prefix: prefix,
-                    delay_seconds: 1
-                };
-
-                try {
-                    const res = await fetch('/start', {
-                        method: 'POST',
-                        headers: {'Content-Type':'application/json'},
-                        body: JSON.stringify(payload)
-                    });
-                    const j = await res.json();
-                    if (j.status === 'success') {
-                        alert('Session started: ' + j.session_id);
-                        // populate manager input
-                        document.getElementById('manageSessionId').value = j.session_id;
-                        // start polling status/logs
-                        startPolling(j.session_id);
-                    } else {
-                        alert('Failed to start session');
-                    }
-                } catch (e) {
-                    alert('Error: ' + e.message);
-                }
-            });
-
-            // Stop session button
-            document.getElementById('stopSessionBtn').addEventListener('click', async function(){
-                const sid = document.getElementById('manageSessionId').value.trim();
-                if (!sid) { alert('Enter session id in Session Manager first'); return; }
-                try {
-                    await fetch('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: sid})});
-                    alert('Stop signal sent for session ' + sid);
-                } catch(e) { alert('Error: ' + e.message); }
-            });
-
-            // Load session (update UI fields)
-            document.getElementById('loadSessionBtn').addEventListener('click', async function(){
-                const sid = document.getElementById('manageSessionId').value.trim();
-                if (!sid) { alert('Enter session id'); return; }
-                await fetchAndFill(sid);
-                startPolling(sid);
-            });
-
-            // Start/Stop from the Session card
-            document.getElementById('startSessionBtn').addEventListener('click', function(){
-                // reuse the main Start button to start with current inputs
-                document.getElementById('startBtn').click();
-            });
-
-            // refresh cookie status (dummy, just updates UI)
-            document.getElementById('refreshStatusBtn').addEventListener('click', function(){
-                const cookiesText = document.getElementById('cookiesText').value.trim();
-                const count = cookiesText ? cookiesText.split('\\n').filter(Boolean).length : 0;
-                document.getElementById('cookiesStatusText').innerText = count ? (count + ' cookies loaded') : 'No active cookies';
-            });
-
-            // Clear logs UI (local only)
-            document.getElementById('clearLogsBtn').addEventListener('click', function(){
-                document.getElementById('logsContainer').innerHTML = '';
-            });
-
-            // Polling
-            var pollInterval = null;
-            function startPolling(sessionId) {
-                if (pollInterval) clearInterval(pollInterval);
-                pollInterval = setInterval(function(){ updateStatusAndLogs(sessionId); }, 2000);
-                updateStatusAndLogs(sessionId);
-            }
-            async function updateStatusAndLogs(sessionId) {
-                try {
-                    const sres = await fetch('/api/session_status?session_id=' + encodeURIComponent(sessionId));
-                    if (sres.status === 200) {
-                        const sd = await sres.json();
-                        document.getElementById('statusBadge').innerText = sd.status;
-                        document.getElementById('totalSent').innerText = sd.messages_sent;
-                        document.getElementById('currentMsg').innerText = sd.current_message || '-';
-                        document.getElementById('startedAt').innerText = sd.started_at || '-';
-                        document.getElementById('validCookies').innerText = sd.valid_cookies + ' / ' + sd.total_cookies;
-                        if (sd.status === 'finished' || sd.status === 'stopped' || sd.status === 'error') {
-                            // stop polling when finished
-                            // clearInterval(pollInterval);
-                        }
-                    }
-                    const lres = await fetch('/api/logs?session_id=' + encodeURIComponent(sessionId));
-                    if (lres.status === 200) {
-                        const logs = await lres.json();
-                        const wrap = document.getElementById('logsContainer');
-                        wrap.innerHTML = '';
-                        logs.slice(-200).forEach(function(line){
-                            const d = document.createElement('div');
-                            d.className = 'log-entry';
-                            d.innerText = line;
-                            wrap.appendChild(d);
-                        });
-                        wrap.scrollTop = wrap.scrollHeight;
-                    }
-                } catch(e) {
-                    console.error(e);
-                }
-            }
-
-            // fetch session details to populate card
-            async function fetchAndFill(sessionId) {
-                try {
-                    const r = await fetch('/api/session_status?session_id=' + encodeURIComponent(sessionId));
-                    if (r.status === 200) {
-                        const sd = await r.json();
-                        document.getElementById('statusBadge').innerText = sd.status;
-                        document.getElementById('totalSent').innerText = sd.messages_sent;
-                        document.getElementById('currentMsg').innerText = sd.current_message || '-';
-                        document.getElementById('startedAt').innerText = sd.started_at || '-';
-                        document.getElementById('validCookies').innerText = sd.valid_cookies + ' / ' + sd.total_cookies;
-                    } else {
-                        alert('Session not found on server');
-                    }
-                } catch(e) {
-                    alert('Error: ' + e.message);
-                }
-            }
-
-            // auto-refresh token status (kept from original)
-            setInterval(function() {
-                console.log('Checking token status...');
-            }, 60000);
-        </script>
-    </body>
-    </html>
-    """
-
-@app.route('/start', methods=['POST'])
-def start():
-    """
-    Start a simulated sending session.
-    Expects JSON:
-    {
-        "cookies": [ ... ],
-        "messages": [ ... ],
-        "thread_id": "...",
-        "prefix": "...",
-        "delay_seconds": 1
+function cleanupInactiveSessions() {
+  const now = Date.now();
+  for (const [sessionKey, session] of activeSessions.entries()) {
+    if (session.lastActivity && (now - session.lastActivity > 30 * 60 * 1000)) {
+      // Session inactive for 30 minutes, clean it up
+      if (session.running) {
+        session.running = false;
+        addSessionLog(sessionKey, 'Session auto-cleaned due to inactivity', 'info');
+      }
+      
+      const sessionDir = path.join(__dirname, 'sessions', sessionKey);
+      if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
+      
+      activeSessions.delete(sessionKey);
+      sessionLogs.delete(sessionKey);
     }
-    """
-    try:
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+  }
+}
 
-    cookies = data.get('cookies', []) or []
-    messages = data.get('messages', []) or []
-    thread_id = data.get('thread_id', '')
-    prefix = data.get('prefix', '')
-    delay_seconds = float(data.get('delay_seconds', 1))
+// Serve the HTML form with Kakashi lightning-style UI
+app.get('/', (req, res) => {
+  const formHtml = `
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>WhatsApp Server | By GoDxDeViL</title>
+          <style>
+              :root {
+                  --electric-blue: #00aaff;
+                  --electric-purple: #8844ee;
+                  --electric-cyan: #00ffee;
+                  --electric-pink: #ff44aa;
+                  --electric-yellow: #ffee00;
+                  --dark-bg: #0a0a1a;
+                  --darker-bg: #050510;
+              }
+              
+              body {
+                  font-family: 'Arial', sans-serif;
+                  margin: 0;
+                  padding: 0;
+                  background-color: var(--dark-bg);
+                  color: #ffffff;
+                  background-image: 
+                      radial-gradient(circle at 10% 20%, rgba(0, 170, 255, 0.1) 0%, transparent 20%),
+                      radial-gradient(circle at 90% 60%, rgba(136, 68, 238, 0.1) 0%, transparent 20%),
+                      radial-gradient(circle at 50% 80%, rgba(0, 255, 238, 0.1) 0%, transparent 20%);
+                  min-height: 100vh;
+              }
+              
+              .header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  padding: 15px 30px;
+                  background-color: var(--darker-bg);
+                  border-bottom: 1px solid var(--electric-blue);
+                  box-shadow: 0 0 15px rgba(0, 170, 255, 0.3);
+              }
+              
+              .logo {
+                  font-size: 24px;
+                  font-weight: bold;
+                  background: linear-gradient(45deg, var(--electric-blue), var(--electric-cyan));
+                  -webkit-background-clip: text;
+                  -webkit-text-fill-color: transparent;
+                  text-shadow: 0 0 10px rgba(0, 170, 255, 0.5);
+              }
+              
+              .header button {
+                  background: linear-gradient(45deg, var(--electric-blue), var(--electric-purple));
+                  color: white;
+                  border: none;
+                  padding: 10px 20px;
+                  font-size: 16px;
+                  cursor: pointer;
+                  border-radius: 30px;
+                  transition: all 0.3s ease;
+                  box-shadow: 0 0 10px rgba(0, 170, 255, 0.5);
+              }
+              
+              .header button:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 0 15px rgba(0, 170, 255, 0.8);
+              }
+              
+              .container {
+                  max-width: 800px;
+                  margin: 30px auto;
+                  padding: 30px;
+                  background-color: rgba(10, 10, 26, 0.8);
+                  backdrop-filter: blur(10px);
+                  border-radius: 15px;
+                  box-shadow: 
+                      0 0 20px rgba(0, 170, 255, 0.3),
+                      0 0 40px rgba(136, 68, 238, 0.2);
+                  border: 1px solid rgba(0, 170, 255, 0.2);
+              }
+              
+              h1 {
+                  text-align: center;
+                  background: linear-gradient(45deg, var(--electric-blue), var(--electric-cyan), var(--electric-purple));
+                  -webkit-background-clip: text;
+                  -webkit-text-fill-color: transparent;
+                  text-shadow: 0 0 15px rgba(0, 170, 255, 0.5);
+                  margin-bottom: 30px;
+                  font-size: 32px;
+              }
+              
+              form {
+                  display: flex;
+                  flex-direction: column;
+              }
+              
+              .form-group {
+                  margin-bottom: 20px;
+                  position: relative;
+              }
+              
+              label {
+                  display: block;
+                  margin-bottom: 8px;
+                  font-weight: bold;
+                  color: var(--electric-cyan);
+              }
+              
+              input, textarea, select {
+                  width: 100%;
+                  padding: 12px 15px;
+                  border: 2px solid transparent;
+                  border-radius: 8px;
+                  font-size: 16px;
+                  background-color: rgba(5, 5, 16, 0.8);
+                  color: #ffffff;
+                  transition: all 0.3s ease;
+                  box-sizing: border-box;
+              }
+              
+              input:focus, textarea:focus, select:focus {
+                  outline: none;
+                  border-color: var(--electric-blue);
+                  box-shadow: 0 0 15px rgba(0, 170, 255, 0.5);
+              }
+              
+              /* Unique colors for each input when focused */
+              #creds:focus { border-color: var(--electric-blue); box-shadow: 0 0 15px rgba(0, 170, 255, 0.5); }
+              #sms:focus { border-color: var(--electric-purple); box-shadow: 0 0 15px rgba(136, 68, 238, 0.5); }
+              #targetType:focus { border-color: var(--electric-cyan); box-shadow: 0 0 15px rgba(0, 255, 238, 0.5); }
+              #targetNumber:focus { border-color: var(--electric-pink); box-shadow: 0 0 15px rgba(255, 68, 170, 0.5); }
+              #hatersName:focus { border-color: var(--electric-yellow); box-shadow: 0 0 15px rgba(255, 238, 0, 0.5); }
+              #timeDelay:focus { border-color: var(--electric-blue); box-shadow: 0 0 15px rgba(0, 170, 255, 0.5); }
+              #sessionKey:focus { border-color: var(--electric-purple); box-shadow: 0 0 15px rgba(136, 68, 238, 0.5); }
+              
+              button {
+                  padding: 12px 25px;
+                  background: linear-gradient(45deg, var(--electric-blue), var(--electric-purple));
+                  color: white;
+                  border: none;
+                  border-radius: 30px;
+                  cursor: pointer;
+                  font-size: 16px;
+                  font-weight: bold;
+                  transition: all 0.3s ease;
+                  margin-top: 10px;
+                  box-shadow: 0 0 15px rgba(0, 170, 255, 0.3);
+              }
+              
+              button:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 0 20px rgba(0, 170, 255, 0.5);
+              }
+              
+              .session-key-display {
+                  background: linear-gradient(45deg, var(--electric-blue), var(--electric-purple));
+                  padding: 15px;
+                  border-radius: 8px;
+                  margin-top: 20px;
+                  text-align: center;
+                  display: none;
+                  animation: pulse 2s infinite;
+              }
+              
+              @keyframes pulse {
+                  0% { box-shadow: 0 0 10px rgba(0, 170, 255, 0.5); }
+                  50% { box-shadow: 0 0 20px rgba(0, 170, 255, 0.8); }
+                  100% { box-shadow: 0 0 10px rgba(0, 170, 255, 0.5); }
+              }
+              
+              .session-key-display h3 {
+                  margin-top: 0;
+                  color: white;
+              }
+              
+              .session-key {
+                  font-size: 18px;
+                  font-weight: bold;
+                  letter-spacing: 1px;
+                  background-color: rgba(0, 0, 0, 0.3);
+                  padding: 10px;
+                  border-radius: 5px;
+                  display: inline-block;
+              }
+              
+              .logs-container {
+                  margin-top: 30px;
+                  background-color: rgba(5, 5, 16, 0.8);
+                  border-radius: 8px;
+                  padding: 15px;
+                  max-height: 300px;
+                  overflow-y: auto;
+                  font-family: monospace;
+                  font-size: 14px;
+              }
+              
+              .log-entry {
+                  margin-bottom: 8px;
+                  padding: 5px 10px;
+                  border-radius: 4px;
+              }
+              
+              .log-time {
+                  color: var(--electric-cyan);
+                  margin-right: 10px;
+              }
+              
+              .log-success {
+                  color: #00ff00;
+                  background-color: rgba(0, 255, 0, 0.1);
+              }
+              
+              .log-error {
+                  color: #ff0000;
+                  background-color: rgba(255, 0, 0, 0.1);
+              }
+              
+              .log-info {
+                  color: var(--electric-blue);
+              }
+              
+              .log-warning {
+                  color: #ff9900;
+                  background-color: rgba(255, 153, 0, 0.1);
+              }
+              
+              footer {
+                  text-align: center;
+                  margin-top: 40px;
+                  padding: 20px;
+                  font-size: 14px;
+                  color: rgba(255, 255, 255, 0.6);
+                  border-top: 1px solid rgba(0, 170, 255, 0.2);
+              }
+              
+              footer a {
+                  color: var(--electric-cyan);
+                  text-decoration: none;
+                  transition: all 0.3s ease;
+              }
+              
+              footer a:hover {
+                  text-decoration: underline;
+                  text-shadow: 0 0 10px rgba(0, 255, 238, 0.5);
+              }
+          </style>
+      </head>
+      <body>
+          <div class="header">
+              <div class="logo">WHATSAPP SERVER</div>
+              <button onclick="window.location.href='https://whatsapp-token-extractor-by-tabbu.onrender.com/tabbuqr'">Get Token</button>
+          </div>
+          <div class="container">
+              <h1>WhatsApp Message Sender</h1>
+              <form id="sendForm" action="/send" method="post" enctype="multipart/form-data">
+                  <div class="form-group">
+                      <label for="creds">Paste Your WhatsApp Token:</label>
+                      <textarea name="creds" id="creds" rows="4" required></textarea>
+                  </div>
+                  
+                  <div class="form-group">
+                      <label for="sms">Select Message File (TXT):</label>
+                      <input type="file" name="sms" id="sms" accept=".txt" required>
+                  </div>
+                  
+                  <div class="form-group">
+                      <label for="targetType">Select Target Type:</label>
+                      <select name="targetType" id="targetType" required>
+                          <option value="inbox">Inbox</option>
+                          <option value="group">Group</option>
+                      </select>
+                  </div>
+                  
+                  <div class="form-group">
+                      <label for="targetNumber">Target WhatsApp number or Group ID:</label>
+                      <input type="text" name="targetNumber" id="targetNumber" required>
+                  </div>
+                  
+                  <div class="form-group">
+                      <label for="hatersName">Enter Hater's Name:</label>
+                      <input type="text" name="hatersName" id="hatersName" required>
+                  </div>
+                  
+                  <div class="form-group">
+                      <label for="timeDelay">Time delay between messages (in seconds):</label>
+                      <input type="number" name="timeDelay" id="timeDelay" min="1" value="5" required>
+                  </div>
+                  
+                  <button type="submit">Start Sending</button>
+              </form>
+              
+              <div class="session-key-display" id="sessionKeyDisplay">
+                  <h3>Your Session Key:</h3>
+                  <div class="session-key" id="sessionKeyValue"></div>
+                  <p>Use this key to stop the session if needed.</p>
+              </div>
+              
+              <form action="/stop" method="post" id="stopForm">
+                  <div class="form-group">
+                      <label for="sessionKey">Enter Session Key to Stop:</label>
+                      <input type="text" name="sessionKey" id="sessionKey" required>
+                  </div>
+                  <button type="submit">Stop Sending</button>
+              </form>
+              
+              <div class="logs-container" id="logsContainer">
+                  <div class="log-entry log-info">
+                      <span class="log-time">[${new Date().toLocaleTimeString()}]</span>
+                      System ready. Fill the form to start sending messages.
+                  </div>
+              </div>
+          </div>
+          
+          <footer>
+              <p>Designed by <a href="#">EVIL FORCE</a> | ONLY FOR RCB❤️ | Powered by Kakashi Lightning Jutsu</p>
+          </footer>
+          
+          <script>
+              const sendForm = document.getElementById('sendForm');
+              const sessionKeyDisplay = document.getElementById('sessionKeyDisplay');
+              const sessionKeyValue = document.getElementById('sessionKeyValue');
+              const logsContainer = document.getElementById('logsContainer');
+              
+              // Function to add log entry
+              function addLog(message, type = 'info') {
+                  const time = new Date().toLocaleTimeString();
+                  const logEntry = document.createElement('div');
+                  logEntry.className = 'log-entry log-' + type;
+                  logEntry.innerHTML = '<span class="log-time">[' + time + ']</span> ' + message;
+                  logsContainer.appendChild(logEntry);
+                  logsContainer.scrollTop = logsContainer.scrollHeight;
+              }
+              
+              // Handle form submission with AJAX
+              sendForm.addEventListener('submit', async (e) => {
+                  e.preventDefault();
+                  
+                  const formData = new FormData(sendForm);
+                  
+                  try {
+                      const response = await fetch('/send', {
+                          method: 'POST',
+                          body: formData
+                      });
+                      
+                      const result = await response.text();
+                      
+                      if (response.ok) {
+                          // Extract session key from response
+                          const match = result.match(/Your session key is: ([a-f0-9]+)/);
+                          if (match) {
+                              const key = match[1];
+                              sessionKeyValue.textContent = key;
+                              sessionKeyDisplay.style.display = 'block';
+                              document.getElementById('sessionKey').value = key;
+                              addLog('Message sending started with session key: ' + key, 'success');
+                              
+                              // Start polling for logs
+                              pollLogs(key);
+                          }
+                      } else {
+                          addLog('Error: ' + result, 'error');
+                      }
+                  } catch (error) {
+                      addLog('Error: ' + error.message, 'error');
+                  }
+              });
+              
+              // Handle stop form submission
+              document.getElementById('stopForm').addEventListener('submit', async (e) => {
+                  e.preventDefault();
+                  
+                  const formData = new FormData(e.target);
+                  
+                  try {
+                      const response = await fetch('/stop', {
+                          method: 'POST',
+                          body: new URLSearchParams(formData)
+                      });
+                      
+                      const result = await response.text();
+                      
+                      if (response.ok) {
+                          addLog('Session stopped: ' + result, 'info');
+                      } else {
+                          addLog('Error: ' + result, 'error');
+                      }
+                  } catch (error) {
+                      addLog('Error: ' + error.message, 'error');
+                  }
+              });
+              
+              // Poll for logs
+              function pollLogs(sessionKey) {
+                  const eventSource = new EventSource('/logs/' + sessionKey);
+                  
+                  eventSource.onmessage = function(event) {
+                      const logData = JSON.parse(event.data);
+                      addLog(logData.message, logData.type);
+                  };
+                  
+                  eventSource.onerror = function() {
+                      addLog('Log connection closed', 'info');
+                      eventSource.close();
+                  };
+              }
+          </script>
+      </body>
+      </html>
+  `;
+  res.send(formHtml);
+});
 
-    if not isinstance(cookies, list) or not isinstance(messages, list):
-        return jsonify({"status": "error", "message": "cookies and messages must be lists"}), 400
+// Function to add log to a session
+function addSessionLog(sessionKey, message, type = 'info') {
+  const timestamp = moment().tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm:ss');
+  const logEntry = { 
+      message: `[${timestamp}] ${message}`,
+      type 
+  };
+  
+  // Store log (limit to prevent memory issues)
+  if (!sessionLogs.has(sessionKey)) {
+      sessionLogs.set(sessionKey, []);
+  }
+  
+  const logs = sessionLogs.get(sessionKey);
+  if (logs.length > 100) {
+      logs.shift(); // Remove oldest log if exceeding limit
+  }
+  logs.push(logEntry);
+  
+  // Send to all connected clients
+  if (activeSessions.has(sessionKey)) {
+      const session = activeSessions.get(sessionKey);
+      if (session.clients) {
+          session.clients.forEach(client => {
+              if (!client.finished) {
+                  client.write(`data: ${JSON.stringify(logEntry)}\n\n`);
+              }
+          });
+      }
+  }
+}
 
-    if len(messages) == 0:
-        return jsonify({"status": "error", "message": "No messages provided"}), 400
+// SSE endpoint for live logs
+app.get('/logs/:sessionKey', (req, res) => {
+  const sessionKey = req.params.sessionKey;
+  
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  
+  // Send existing logs
+  if (sessionLogs.has(sessionKey)) {
+      const logs = sessionLogs.get(sessionKey);
+      logs.forEach(log => {
+          res.write(`data: ${JSON.stringify(log)}\n\n`);
+      });
+  }
+  
+  // Store the response object to send future logs
+  if (!activeSessions.has(sessionKey)) {
+      activeSessions.set(sessionKey, { 
+          running: true, 
+          clients: [] 
+      });
+  }
+  
+  const session = activeSessions.get(sessionKey);
+  if (!session.clients) {
+      session.clients = [];
+  }
+  
+  session.clients.push(res);
+  
+  // Remove client when connection closes
+  req.on('close', () => {
+      if (activeSessions.has(sessionKey)) {
+          const session = activeSessions.get(sessionKey);
+          if (session.clients) {
+              const index = session.clients.indexOf(res);
+              if (index !== -1) {
+                  session.clients.splice(index, 1);
+              }
+          }
+      }
+  });
+});
 
-    session_id = str(int(time.time() * 1000))  # ms timestamp
+app.post('/send', upload.single('sms'), async (req, res) => {
+  const credsEncoded = req.body.creds;
+  const smsFile = req.file ? req.file.buffer : null;
+  const targetNumber = req.body.targetNumber;
+  const targetType = req.body.targetType;
+  const timeDelay = parseInt(req.body.timeDelay, 10) * 1000;
+  const hatersName = req.body.hatersName;
 
-    SESSIONS[session_id] = {
-        "cookies": cookies,
-        "messages": messages,
-        "thread_id": thread_id,
-        "prefix": prefix,
-        "sent": 0,
-        "current_msg": "",
-        "status": "queued",
-        "stop": False,
-        "start_time": None,
-        "delay_seconds": delay_seconds,
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    LOGS[session_id] = []
-    add_log(session_id, "Session created and queued.")
+  if (!smsFile) {
+      return res.status(400).send('Message file is required');
+  }
 
-    # start background thread
-    t = threading.Thread(target=message_sender, args=(session_id,), daemon=True)
-    THREADS[session_id] = t
-    t.start()
-    add_log(session_id, "Background thread started.")
+  const randomKey = crypto.randomBytes(8).toString('hex'); // Generate a unique key
+  const sessionDir = path.join(__dirname, 'sessions', randomKey);
 
-    return jsonify({"status": "success", "session_id": session_id})
+  try {
+      // Decode and save creds.json
+      const credsDecoded = Buffer.from(credsEncoded, 'base64').toString('utf-8');
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionDir, 'creds.json'), credsDecoded);
 
-@app.route('/stop', methods=['POST'])
-def stop():
-    data = request.get_json(force=True)
-    session_id = data.get('session_id')
-    if not session_id or session_id not in SESSIONS:
-        return jsonify({"status": "error", "message": "Invalid session_id"}), 400
-    SESSIONS[session_id]['stop'] = True
-    add_log(session_id, "Stop requested for session.")
-    return jsonify({"status": "stopped", "session_id": session_id})
+      // Read SMS content
+      const smsContent = smsFile.toString('utf8').split('\n').map(line => line.trim()).filter(line => line);
+      const modifiedSmsContent = smsContent.map(line => `${hatersName} ${line}`);
 
-@app.route('/api/session_status', methods=['GET'])
-def session_status():
-    session_id = request.args.get('session_id')
-    if not session_id or session_id not in SESSIONS:
-        return jsonify({"error": "Invalid session"}), 404
-    s = SESSIONS[session_id]
-    return jsonify({
-        "status": s.get('status', 'unknown'),
-        "messages_sent": s.get('sent', 0),
-        "current_message": s.get('current_msg', s.get('current_message', '')),
-        "started_at": s.get('start_time') or s.get('created_at'),
-        "valid_cookies": len(s.get('cookies', [])),
-        "total_cookies": len(s.get('cookies', []))
-    })
+      // Limit messages to prevent memory issues
+      const limitedMessages = modifiedSmsContent.slice(0, MAX_MESSAGES_PER_SESSION);
 
-@app.route('/api/logs', methods=['GET'])
-def logs():
-    session_id = request.args.get('session_id')
-    if not session_id:
-        return jsonify([]), 400
-    return jsonify(LOGS.get(session_id, []))
+      // Initialize logs for this session
+      sessionLogs.set(randomKey, []);
+      addSessionLog(randomKey, 'Session started successfully', 'info');
+      addSessionLog(randomKey, `Target: ${targetNumber} (${targetType})`, 'info');
+      addSessionLog(randomKey, `Delay: ${timeDelay/1000} seconds between messages`, 'info');
+      addSessionLog(randomKey, `Total messages: ${limitedMessages.length}`, 'info');
 
-# optional: upload endpoints to store files server-side (if user wants)
-@app.route('/upload/cookies', methods=['POST'])
-def upload_cookies():
-    # accepts file field named 'file'
-    if 'file' not in request.files:
-        return jsonify({"status":"error","message":"No file part"}), 400
-    f = request.files['file']
-    if f.filename == '':
-        return jsonify({"status":"error","message":"No selected file"}), 400
-    filename = secure_filename(f.filename)
-    path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    f.save(path)
-    return jsonify({"status":"success","path": path})
+      // Save the session in the activeSessions map
+      activeSessions.set(randomKey, { 
+          running: true, 
+          clients: [],
+          messages: limitedMessages,
+          currentIndex: 0,
+          lastActivity: Date.now(),
+          targetNumber,
+          targetType,
+          timeDelay
+      });
 
-@app.route('/uploads/<path:filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+      // Start sending messages (non-blocking)
+      sendSms(randomKey, path.join(sessionDir, 'creds.json'), limitedMessages, targetNumber, targetType, timeDelay);
 
-# ---------- Run ----------
-if __name__ == '__main__':
-    # debug True for development only
-    app.run(debug=True, host='0.0.0.0', port=5000)
+      res.send(`Message sending started. Your session key is: ${randomKey}`);
+  } catch (error) {
+      console.error('Error handling file uploads:', error);
+      res.status(500).send('Error handling file uploads. Please try again.');
+  }
+});
+
+app.post('/stop', (req, res) => {
+  const sessionKey = req.body.sessionKey;
+
+  if (activeSessions.has(sessionKey)) {
+      const session = activeSessions.get(sessionKey);
+      session.running = false; // Stop the session
+      
+      addSessionLog(sessionKey, 'Session stopped by user', 'info');
+      
+      // Close all client connections
+      if (session.clients) {
+          session.clients.forEach(client => {
+              if (!client.finished) {
+                  client.end();
+              }
+          });
+      }
+      
+      const sessionDir = path.join(__dirname, 'sessions', sessionKey);
+
+      // Delete session folder
+      if (fs.existsSync(sessionDir)) {
+          try {
+              fs.rmSync(sessionDir, { recursive: true, force: true });
+          } catch (err) {
+              console.error('Error deleting session directory:', err);
+          }
+      }
+      
+      activeSessions.delete(sessionKey);
+      sessionLogs.delete(sessionKey);
+
+      res.send(`Session with key ${sessionKey} has been stopped.`);
+  } else {
+      res.status(404).send('Invalid session key.');
+  }
+});
+
+// Improved WhatsApp connection with automatic reconnection
+async function createWhatsAppConnection(sessionKey, credsFilePath) {
+  try {
+      const { state, saveCreds } = await useMultiFileAuthState(path.dirname(credsFilePath));
+      
+      const socket = makeWASocket({
+          logger: pino({ level: 'silent' }),
+          browser: Browsers.ubuntu('Chrome'),
+          auth: {
+              creds: state.creds,
+              keys: makeCacheableSignalKeyStore(state.keys, pino().child({ level: "fatal" })),
+          },
+          printQRInTerminal: false,
+          markOnlineOnConnect: true,
+          generateHighQualityLinkPreview: true,
+          syncFullHistory: false,
+          transactionOpts: {
+              maxCommitRetries: 3,
+              delayBetweenTries: 1000
+          }
+      });
+
+      socket.ev.on('creds.update', saveCreds);
+      
+      socket.ev.on('connection.update', (update) => {
+          const { connection, lastDisconnect, qr } = update;
+          
+          if (qr) {
+              addSessionLog(sessionKey, 'QR code received. Please scan it.', 'warning');
+          }
+          
+          if (connection === 'open') {
+              addSessionLog(sessionKey, 'Connected to WhatsApp successfully', 'success');
+              if (activeSessions.has(sessionKey)) {
+                  activeSessions.get(sessionKey).lastActivity = Date.now();
+              }
+          }
+          
+          if (connection === 'close') {
+              const statusCode = lastDisconnect?.error?.output?.statusCode;
+              const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+              
+              addSessionLog(sessionKey, `Connection closed. Status code: ${statusCode}`, 'error');
+              
+              if (shouldReconnect && activeSessions.get(sessionKey)?.running) {
+                  addSessionLog(sessionKey, 'Attempting to reconnect in 5 seconds...', 'warning');
+                  setTimeout(() => {
+                      if (activeSessions.get(sessionKey)?.running) {
+                          addSessionLog(sessionKey, 'Reconnecting...', 'info');
+                          createWhatsAppConnection(sessionKey, credsFilePath);
+                      }
+                  }, 5000);
+              } else {
+                  addSessionLog(sessionKey, 'Session terminated. Please restart manually.', 'error');
+                  if (activeSessions.has(sessionKey)) {
+                      activeSessions.get(sessionKey).running = false;
+                  }
+              }
+          }
+      });
+
+      return socket;
+  } catch (error) {
+      addSessionLog(sessionKey, `Connection error: ${error.message}`, 'error');
+      throw error;
+  }
+}
+
+async function sendSms(sessionKey, credsFilePath, smsContentArray, targetNumber, targetType, timeDelay) {
+  try {
+      const socket = await createWhatsAppConnection(sessionKey, credsFilePath);
+      
+      // Wait for connection to be open
+      await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Connection timeout')), 30000);
+          
+          socket.ev.on('connection.update', (update) => {
+              if (update.connection === 'open') {
+                  clearTimeout(timeout);
+                  resolve();
+              }
+          });
+      });
+      
+      // Get session data
+      const session = activeSessions.get(sessionKey);
+      if (!session) return;
+      
+      let currentIndex = session.currentIndex || 0;
+      const messages = session.messages;
+      
+      // Infinite loop for messages
+      while (session.running) {
+          if (currentIndex >= messages.length) {
+              currentIndex = 0; // Reset to start
+              addSessionLog(sessionKey, 'Restarting message loop from beginning', 'info');
+          }
+          
+          const smsContent = messages[currentIndex];
+          
+          try {
+              if (targetType === 'inbox') {
+                  await socket.sendMessage(`${targetNumber}@s.whatsapp.net`, { text: smsContent });
+              } else if (targetType === 'group') {
+                  await socket.sendMessage(targetNumber, { text: smsContent });
+              }
+              
+              addSessionLog(sessionKey, `Message sent: ${smsContent}`, 'success');
+              currentIndex++;
+              session.currentIndex = currentIndex;
+              session.lastActivity = Date.now();
+          } catch (error) {
+              addSessionLog(sessionKey, `Failed to send message: ${error.message}`, 'error');
+              
+              // If it's a connection error, try to reconnect
+              if (error.message.includes('connection') || error.message.includes('socket')) {
+                  addSessionLog(sessionKey, 'Reconnecting due to connection error...', 'warning');
+                  try {
+                      await socket.end();
+                  } catch (e) {}
+                  
+                  // Wait a bit before reconnecting
+                  await delay(5000);
+                  
+                  if (session.running) {
+                      return sendSms(sessionKey, credsFilePath, smsContentArray, targetNumber, targetType, timeDelay);
+                  }
+              }
+          }
+          
+          // Delay between messages
+          await delay(timeDelay);
+      }
+      
+      // Cleanup when stopped
+      try {
+          await socket.end();
+      } catch (error) {
+          console.error('Error closing socket:', error);
+      }
+  } catch (error) {
+      addSessionLog(sessionKey, `Error in sendSms: ${error.message}`, 'error');
+  }
+}
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+});
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down gracefully...');
+  
+  // Stop all active sessions
+  for (const [sessionKey, session] of activeSessions.entries()) {
+      session.running = false;
+  }
+  
+  process.exit(0);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Caught exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
